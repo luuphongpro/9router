@@ -6,17 +6,33 @@ const ROUTER_BASE = String(process.env.MITM_ROUTER_BASE || DEFAULT_LOCAL_ROUTER)
   .replace(/\/+$/, "") || DEFAULT_LOCAL_ROUTER;
 const API_KEY = process.env.ROUTER_API_KEY;
 
-// Headers that must not be forwarded to 9Router
+// Danh sách header không được chuyển tiếp sang 9Router
 const STRIP_HEADERS = new Set([
   "host", "content-length", "connection", "transfer-encoding",
   "content-type", "authorization"
 ]);
 
+// Hàm đợi socket drain hoặc close an toàn, tránh treo Promise vĩnh viễn khi client ngắt kết nối
+function waitForDrain(res) {
+  if (res.writableEnded || res.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); resolve(); };
+    const cleanup = () => {
+      res.removeListener("drain", onDrain);
+      res.removeListener("close", onClose);
+    };
+    res.once("drain", onDrain);
+    res.once("close", onClose);
+  });
+}
+
+
 /**
- * Send body to 9Router at the given path and return the fetch Response object.
- * Optionally forwards client headers (stripped of hop-by-hop / overridden keys).
+ * Gửi request body tới 9Router theo đường dẫn và trả về Fetch Response object.
+ * Hỗ trợ chuyển tiếp clientHeaders (đã loại bỏ các header nhạy cảm/hop-by-hop).
  */
-async function fetchRouter(openaiBody, path = "/v1/chat/completions", clientHeaders = {}) {
+async function fetchRouter(openaiBody, path = "/v1/chat/completions", clientHeaders = {}, signal) {
   const forwarded = {};
   for (const [k, v] of Object.entries(clientHeaders)) {
     if (!STRIP_HEADERS.has(k.toLowerCase())) forwarded[k] = v;
@@ -29,16 +45,16 @@ async function fetchRouter(openaiBody, path = "/v1/chat/completions", clientHead
       "Content-Type": "application/json",
       ...(API_KEY && { "Authorization": `Bearer ${API_KEY}` })
     },
-    body: JSON.stringify(openaiBody)
+    body: JSON.stringify(openaiBody),
+    signal
   });
 
-  // Forward response as-is (status + body). pipeSSE will propagate status.
   return response;
 }
 
 /**
- * Pipe SSE stream from router directly to client response.
- * Optional dumper tees the stream into a debug file.
+ * Chuyển tiếp stream SSE từ 9Router trực tiếp sang client response.
+ * Xử lý hủy stream khi client ngắt kết nối và hỗ trợ backpressure.
  */
 async function pipeSSE(routerRes, res, dumper) {
   const ct = routerRes.headers.get("content-type") || "application/json";
@@ -57,23 +73,42 @@ async function pipeSSE(routerRes, res, dumper) {
 
   const reader = routerRes.body.getReader();
   const decoder = new TextDecoder();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) { if (dumper) dumper.end(); res.end(); break; }
-    if (dumper) dumper.writeChunk(value);
-    res.write(decoder.decode(value, { stream: true }));
+  let clientClosed = false;
+
+  const onClientClose = () => {
+    clientClosed = true;
+    try { reader.cancel(); } catch {}
+  };
+  res.once("close", onClientClose);
+
+  try {
+    while (!clientClosed) {
+      const { done, value } = await reader.read();
+      if (done) {
+        if (dumper) dumper.end();
+        if (!res.writableEnded) res.end();
+        break;
+      }
+      if (dumper) dumper.writeChunk(value);
+      const canWrite = res.write(decoder.decode(value, { stream: true }));
+      if (!canWrite && !clientClosed) {
+        await waitForDrain(res);
+      }
+    }
+  } catch (e) {
+    if (!clientClosed) {
+      err(`[mitm] pipeSSE read error: ${e.message}`);
+    }
+  } finally {
+    res.removeListener("close", onClientClose);
+    try { reader.cancel(); } catch {}
   }
 }
 
 /**
- * Pipe SSE stream from router, transforming each chunk through a user function.
- * Reads SSE data: lines, parses JSON, calls transformFn(parsed, state),
- * and writes returned SSE strings to the client response.
- *
- * @param {Response} routerRes - Fetch Response from 9Router
- * @param {http.ServerResponse} res - Client response
- * @param {Function} transformFn - (parsedChunk, state) => string|string[]|null
- * @param {object} state - Mutable state object shared across chunks and flush
+ * Chuyển tiếp stream SSE từ 9Router, chuyển đổi từng chunk qua hàm transformFn.
+ * Đọc dữ liệu dòng SSE data:, parse JSON, gọi transformFn(parsed, state)
+ * và ghi chuỗi SSE kết quả vào client response.
  */
 async function pipeTransformedSSE(routerRes, res, transformFn, state) {
   const ct = routerRes.headers.get("content-type") || "application/json";
@@ -89,70 +124,83 @@ async function pipeTransformedSSE(routerRes, res, transformFn, state) {
   const reader = routerRes.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: false });
   let buffer = "";
+  let clientClosed = false;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  const onClientClose = () => {
+    clientClosed = true;
+    try { reader.cancel(); } catch {}
+  };
+  res.once("close", onClientClose);
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+  try {
+    while (!clientClosed) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data:")) continue;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
 
-      const data = trimmed.slice(5).trim();
-      if (data === "[DONE]") continue;
+      for (const line of lines) {
+        if (clientClosed) break;
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
 
-      if (process.env.DEBUG_MITM) {
-        log(`[SSE in] ${data.slice(0, 200)}`);
-      }
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") continue;
 
-      try {
-        const parsed = JSON.parse(data);
-        const result = transformFn(parsed, state);
-        if (result != null) {
-          const outputs = Array.isArray(result) ? result : [result];
-          for (const output of outputs) {
-            if (process.env.DEBUG_MITM) {
-              const len = output.length || output.byteLength || 0;
-              log(`[write binary frame] (${len}B) first 20B: ${Array.from(output.slice(0, 20)).join(',')}`);
+        if (process.env.DEBUG_MITM) {
+          log(`[SSE in] ${data.slice(0, 200)}`);
+        }
+
+        try {
+          const parsed = JSON.parse(data);
+          const result = transformFn(parsed, state);
+          if (result != null) {
+            const outputs = Array.isArray(result) ? result : [result];
+            for (const output of outputs) {
+              if (process.env.DEBUG_MITM) {
+                const len = output.length || output.byteLength || 0;
+                log(`[write binary frame] (${len}B) first 20B: ${Array.from(output.slice(0, 20)).join(",")}`);
+              }
+              const canWrite = res.write(Buffer.from(output));
+              if (!canWrite && !clientClosed) {
+                await waitForDrain(res);
+              }
             }
-            res.write(Buffer.from(output));
+          }
+        } catch {
+          // Bỏ qua các dòng không parse được JSON
+        }
+      }
+    }
+
+    // Flush trạng thái kết thúc stream nếu client chưa đóng
+    if (!clientClosed) {
+      try {
+        const flushed = transformFn(null, state);
+        if (flushed != null) {
+          const outputs = Array.isArray(flushed) ? flushed : [flushed];
+          for (const output of outputs) {
+            res.write(output);
           }
         }
-      } catch {
-        // Skip unparseable lines
-      }
+      } catch {}
+      if (!res.writableEnded) res.end();
     }
+  } catch (e) {
+    if (!clientClosed) {
+      err(`[mitm] pipeTransformedSSE error: ${e.message}`);
+    }
+  } finally {
+    res.removeListener("close", onClientClose);
+    try { reader.cancel(); } catch {}
   }
-
-  // Flush: pass null to signal stream end
-  try {
-    const flushed = transformFn(null, state);
-    if (flushed != null) {
-      const outputs = Array.isArray(flushed) ? flushed : [flushed];
-      for (const output of outputs) {
-        res.write(output);
-      }
-    }
-  } catch { /* ignore flush errors */ }
-
-  res.end();
 }
 
 /**
- * Pipe SSE stream from router, transforming each chunk through a user function,
- * and writing binary EventStream frames to the client.
- *
- * Reads SSE data: lines, parses JSON, calls transformFn(parsed, state),
- * and writes returned Uint8Array frames to the client response.
- *
- * @param {Response} routerRes - Fetch Response from 9Router
- * @param {http.ServerResponse} res - Client response
- * @param {Function} transformFn - (parsedChunk, state) => Uint8Array|Uint8Array[]|null
- * @param {object} state - Mutable state object shared across chunks and flush
+ * Chuyển tiếp stream SSE từ 9Router, chuyển đổi từng chunk qua hàm transformFn,
+ * và ghi binary EventStream frames về client (dành cho Kiro/AWS EventStream).
  */
 async function pipeTransformedEventStream(routerRes, res, transformFn, state) {
   const resHeaders = {
@@ -170,57 +218,78 @@ async function pipeTransformedEventStream(routerRes, res, transformFn, state) {
   const reader = routerRes.body.getReader();
   const decoder = new TextDecoder("utf-8", { fatal: false });
   let buffer = "";
+  let clientClosed = false;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  const onClientClose = () => {
+    clientClosed = true;
+    try { reader.cancel(); } catch {}
+  };
+  res.once("close", onClientClose);
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+  try {
+    while (!clientClosed) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith("data:")) continue;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
 
-      const data = trimmed.slice(5).trim();
-      if (data === "[DONE]") continue;
+      for (const line of lines) {
+        if (clientClosed) break;
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data:")) continue;
 
-      if (process.env.DEBUG_MITM) {
-        log(`[SSE in] ${data.slice(0, 200)}`);
-      }
+        const data = trimmed.slice(5).trim();
+        if (data === "[DONE]") continue;
 
-      try {
-        const parsed = JSON.parse(data);
-        const result = transformFn(parsed, state);
-        if (result != null) {
-          const outputs = Array.isArray(result) ? result : [result];
-          for (const output of outputs) {
-            if (process.env.DEBUG_MITM) {
-              const len = output.length || output.byteLength || 0;
-              log(`[write binary frame] (${len}B) first 20B: ${Array.from(output.slice(0, 20)).join(',')}`);
+        if (process.env.DEBUG_MITM) {
+          log(`[SSE in] ${data.slice(0, 200)}`);
+        }
+
+        try {
+          const parsed = JSON.parse(data);
+          const result = transformFn(parsed, state);
+          if (result != null) {
+            const outputs = Array.isArray(result) ? result : [result];
+            for (const output of outputs) {
+              if (process.env.DEBUG_MITM) {
+                const len = output.length || output.byteLength || 0;
+                log(`[write binary frame] (${len}B) first 20B: ${Array.from(output.slice(0, 20)).join(",")}`);
+              }
+              const canWrite = res.write(Buffer.from(output));
+              if (!canWrite && !clientClosed) {
+                await waitForDrain(res);
+              }
             }
-            res.write(Buffer.from(output));
+          }
+        } catch {
+          // Bỏ qua các dòng không parse được JSON
+        }
+      }
+    }
+
+    // Flush trạng thái kết thúc stream nếu client chưa đóng
+    if (!clientClosed) {
+      try {
+        const flushed = transformFn(null, state);
+        if (flushed != null) {
+          const outputs = Array.isArray(flushed) ? flushed : [flushed];
+          for (const output of outputs) {
+            res.write(output);
           }
         }
-      } catch {
-        // Skip unparseable lines
-      }
+      } catch {}
+      if (!res.writableEnded) res.end();
     }
+  } catch (e) {
+    if (!clientClosed) {
+      err(`[mitm] pipeTransformedEventStream error: ${e.message}`);
+    }
+  } finally {
+    res.removeListener("close", onClientClose);
+    try { reader.cancel(); } catch {}
   }
-
-  // Flush: pass null to signal stream end
-  try {
-    const flushed = transformFn(null, state);
-    if (flushed != null) {
-      const outputs = Array.isArray(flushed) ? flushed : [flushed];
-      for (const output of outputs) {
-        res.write(output);
-      }
-    }
-  } catch { /* ignore flush errors */ }
-
-  res.end();
 }
 
 module.exports = { fetchRouter, pipeSSE, pipeTransformedSSE, pipeTransformedEventStream };

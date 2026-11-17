@@ -89,10 +89,49 @@ async function resolveTargetIP(hostname) {
 
 function collectBodyRaw(req) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on("data", chunk => chunks.push(chunk));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    let chunks = [];
+    let completed = false;
+
+    const cleanup = () => {
+      req.removeListener("data", onData);
+      req.removeListener("end", onEnd);
+      req.removeListener("error", onError);
+      req.removeListener("close", onClose);
+      chunks = null;
+    };
+
+    const onData = (chunk) => {
+      if (chunks) chunks.push(chunk);
+    };
+
+    const onEnd = () => {
+      if (completed) return;
+      completed = true;
+      const result = chunks ? Buffer.concat(chunks) : Buffer.alloc(0);
+      cleanup();
+      resolve(result);
+    };
+
+    const onError = (e) => {
+      if (completed) return;
+      completed = true;
+      cleanup();
+      reject(e);
+    };
+
+    const onClose = () => {
+      if (completed) return;
+      completed = true;
+      cleanup();
+      const err = new Error("Client closed connection prematurely");
+      err.code = "ECONNRESET";
+      reject(err);
+    };
+
+    req.on("data", onData);
+    req.once("end", onEnd);
+    req.once("error", onError);
+    req.once("close", onClose);
   });
 }
 
@@ -174,10 +213,38 @@ async function negotiateAlpn(host) {
   });
 }
 
-// HTTP/2 passthrough using node:http2 native
+// Pool HTTP/2 session theo host — tái dùng thay vì tạo mới mỗi request
+const h2SessionPool = new Map(); // host → http2.ClientHttp2Session
+
+function getH2Session(targetHost, targetIP) {
+  const existing = h2SessionPool.get(targetHost);
+  if (existing && !existing.destroyed && !existing.closed) {
+    return existing;
+  }
+  const session = http2.connect(`https://${targetHost}`, {
+    createConnection: () => tls.connect({
+      host: targetIP, port: 443, servername: targetHost,
+      ALPNProtocols: ["h2"], rejectUnauthorized: false,
+    }),
+  });
+  h2SessionPool.set(targetHost, session);
+  session.once("error", () => {
+    if (h2SessionPool.get(targetHost) === session) h2SessionPool.delete(targetHost);
+  });
+  session.once("close", () => {
+    if (h2SessionPool.get(targetHost) === session) h2SessionPool.delete(targetHost);
+  });
+  session.once("goaway", () => {
+    if (h2SessionPool.get(targetHost) === session) h2SessionPool.delete(targetHost);
+    try { session.destroy(); } catch {}
+  });
+  return session;
+}
+
+// Chuyển tiếp HTTP/2 sử dụng module node:http2 native với pool session
 async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onResponse, dumper) {
   const targetIP = await resolveTargetIP(targetHost);
-  // HTTP/2 pseudo-headers required; strip HTTP/1.1-only headers
+  // Loại bỏ các header dành riêng cho HTTP/1.1
   const h2Headers = {};
   for (const [k, v] of Object.entries(headers)) {
     const lk = k.toLowerCase();
@@ -191,27 +258,56 @@ async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onRes
   h2Headers[":authority"] = targetHost;
 
   return new Promise((resolve) => {
-    const client = http2.connect(`https://${targetHost}`, {
-      createConnection: () => tls.connect({
-        host: targetIP, port: 443, servername: targetHost,
-        ALPNProtocols: ["h2"], rejectUnauthorized: false,
-      }),
-    });
-    client.once("error", (e) => {
-      err(`[mitm] http2 client error: ${e.message}`);
-      if (dumper) { dumper.writeChunk(`\n[ERROR h2] ${e.message}\n`); dumper.end(); }
+    let stream = null;
+    let settled = false;
+
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      res.removeListener("close", onClientAbort);
+      req.removeListener("close", onClientAbort);
+      if (stream && !stream.destroyed) {
+        try { stream.destroy(); } catch {}
+      }
+      stream = null;
+      resolve();
+    };
+
+    const onClientAbort = () => {
+      cleanup();
+    };
+
+    req.once("close", onClientAbort);
+    res.once("close", onClientAbort);
+
+    let client;
+    try {
+      client = getH2Session(targetHost, targetIP);
+    } catch (e) {
+      err(`[mitm] http2 session error: ${e.message}`);
       if (!res.headersSent) res.writeHead(502);
       if (!res.writableEnded) res.end("Bad Gateway");
-      try { client.close(); } catch {}
-      resolve();
-    });
+      cleanup();
+      return;
+    }
 
-    const stream = client.request(h2Headers, { endStream: bodyBuffer.length === 0 });
+    try {
+      stream = client.request(h2Headers, { endStream: bodyBuffer.length === 0 });
+    } catch (e) {
+      err(`[mitm] http2 request error: ${e.message}`);
+      if (!res.headersSent) res.writeHead(502);
+      if (!res.writableEnded) res.end("Bad Gateway");
+      // Xoá session lỗi khỏi pool để request sau tạo session mới
+      if (h2SessionPool.get(targetHost) === client) h2SessionPool.delete(targetHost);
+      cleanup();
+      return;
+    }
+
     if (bodyBuffer.length > 0) stream.end(bodyBuffer);
 
     stream.once("response", (responseHeaders) => {
+      if (settled) return;
       const status = responseHeaders[":status"];
-      // Filter pseudo-headers + connection-specific
       const outHeaders = {};
       for (const [k, v] of Object.entries(responseHeaders)) {
         if (k.startsWith(":")) continue;
@@ -223,33 +319,57 @@ async function passthroughHttp2(req, res, bodyBuffer, headers, targetHost, onRes
 
       const chunks = [];
       stream.on("data", chunk => {
+        if (settled) return;
         if (dumper) dumper.writeChunk(chunk);
         if (onResponse) chunks.push(chunk);
-        res.write(chunk);
+        const canWrite = res.write(chunk);
+        if (!canWrite && stream && !stream.destroyed) {
+          stream.pause();
+          const resumeStream = () => {
+            res.removeListener("drain", resumeStream);
+            res.removeListener("close", resumeStream);
+            if (stream && !stream.destroyed) stream.resume();
+          };
+          res.once("drain", resumeStream);
+          res.once("close", resumeStream);
+        }
       });
-      stream.on("end", () => {
+
+      stream.once("end", () => {
+        if (settled) return;
         if (dumper) dumper.end();
         if (!res.writableEnded) res.end();
         if (onResponse) try { onResponse(Buffer.concat(chunks), outHeaders); } catch {}
-        try { client.close(); } catch {}
-        resolve();
+        cleanup();
       });
     });
+
     stream.once("error", (e) => {
       err(`[mitm] http2 stream error: ${e.message}`);
       if (dumper) { dumper.writeChunk(`\n[ERROR h2-stream] ${e.message}\n`); dumper.end(); }
       if (!res.headersSent) res.writeHead(502);
       if (!res.writableEnded) res.end();
-      try { client.close(); } catch {}
-      resolve();
+      cleanup();
     });
   });
 }
 
-// Fallback: raw https.request HTTP/1.1 with custom DNS (bypasses /etc/hosts MITM loop)
+// Chuyển tiếp HTTPS raw HTTP/1.1 với DNS độc lập và ngắt kết nối tự động khi client huỷ
 async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onResponse, dumper) {
   const targetIP = await resolveTargetIP(targetHost);
-  const forwardReq = https.request({
+  let forwardReq = null;
+  let settled = false;
+
+  const onClientClose = () => {
+    if (settled) return;
+    settled = true;
+    if (forwardReq) {
+      try { forwardReq.destroy(); } catch {}
+    }
+  };
+  res.once("close", onClientClose);
+
+  forwardReq = https.request({
     hostname: targetIP,
     port: 443,
     path: req.url,
@@ -258,32 +378,55 @@ async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onRes
     servername: targetHost,
     rejectUnauthorized: false
   }, (forwardRes) => {
+    if (settled) return;
     res.writeHead(forwardRes.statusCode, forwardRes.headers);
     if (dumper) dumper.writeHeader(forwardRes.statusCode, forwardRes.headers);
 
     if (!onResponse && !dumper) {
       forwardRes.pipe(res);
+      forwardRes.on("end", () => {
+        settled = true;
+        res.removeListener("close", onClientClose);
+      });
       return;
     }
 
     const chunks = [];
     forwardRes.on("data", chunk => {
+      if (settled) return;
       if (dumper) dumper.writeChunk(chunk);
       if (onResponse) chunks.push(chunk);
-      res.write(chunk);
+      const canWrite = res.write(chunk);
+      if (!canWrite && forwardRes && !forwardRes.destroyed) {
+        forwardRes.pause();
+        const resumeReq = () => {
+          res.removeListener("drain", resumeReq);
+          res.removeListener("close", resumeReq);
+          if (forwardRes && !forwardRes.destroyed) forwardRes.resume();
+        };
+        res.once("drain", resumeReq);
+        res.once("close", resumeReq);
+      }
     });
-    forwardRes.on("end", () => {
+
+    forwardRes.once("end", () => {
+      if (settled) return;
+      settled = true;
+      res.removeListener("close", onClientClose);
       if (dumper) dumper.end();
-      res.end();
-      if (onResponse) try { onResponse(Buffer.concat(chunks), forwardRes.headers); } catch { /* ignore */ }
+      if (!res.writableEnded) res.end();
+      if (onResponse) try { onResponse(Buffer.concat(chunks), forwardRes.headers); } catch {}
     });
   });
 
-  forwardReq.on("error", (e) => {
+  forwardReq.once("error", (e) => {
+    if (settled) return;
+    settled = true;
+    res.removeListener("close", onClientClose);
     err(`Passthrough error: ${e.message}`);
     if (dumper) { dumper.writeChunk(`\n[ERROR] ${e.message}\n`); dumper.end(); }
     if (!res.headersSent) res.writeHead(502);
-    res.end("Bad Gateway");
+    if (!res.writableEnded) res.end("Bad Gateway");
   });
 
   if (bodyBuffer.length > 0) forwardReq.write(bodyBuffer);
@@ -295,8 +438,21 @@ async function passthroughHttps(req, res, bodyBuffer, headers, targetHost, onRes
 const server = https.createServer(sslOptions, async (req, res) => {
   try {
     if (req.url === "/_mitm_health") {
+      const mem = process.memoryUsage();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, pid: process.pid }));
+      res.end(JSON.stringify({
+        ok: true,
+        pid: process.pid,
+        uptime: Math.round(process.uptime()),
+        memory: {
+          rssMB: +(mem.rss / 1024 / 1024).toFixed(1),
+          heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1),
+          heapTotalMB: +(mem.heapTotal / 1024 / 1024).toFixed(1),
+          externalMB: +(mem.external / 1024 / 1024).toFixed(1),
+          arrayBuffersMB: +(mem.arrayBuffers / 1024 / 1024).toFixed(1),
+        },
+        h2Sessions: h2SessionPool.size
+      }));
       return;
     }
 
@@ -336,9 +492,13 @@ const server = https.createServer(sslOptions, async (req, res) => {
 
     return handlers[tool].intercept(req, res, bodyBuffer, mappedModel, passthrough);
   } catch (e) {
+    if (e.code === "ECONNRESET" || req.destroyed || res.destroyed) {
+      // Client dong ket noi som hoac bi huy (keystroke autocomplete cancel)
+      return;
+    }
     err(`Unhandled error: ${e.message}`);
     if (!res.headersSent) res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: e.message, type: "mitm_error" } }));
+    if (!res.writableEnded) res.end(JSON.stringify({ error: { message: e.message, type: "mitm_error" } }));
   }
 });
 
