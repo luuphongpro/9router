@@ -33,6 +33,7 @@ impl Tool {
 /// Trình quản lý cấu hình và danh mục alias
 #[derive(Clone)]
 pub struct AppConfig {
+    #[allow(dead_code)]
     pub data_dir: PathBuf,
     pub mitm_dir: PathBuf,
     pub router_base: String,
