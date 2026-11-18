@@ -81,8 +81,17 @@ impl RouterForwarder {
             .map(|ct| ct.contains("text/event-stream"))
             .unwrap_or(false);
 
-        // Tạo body stream chuyển tiếp về client (sử dụng Rust SSE pipeline nếu bật và là stream)
-        let boxed_body = if self.config.enable_rust_streamer && is_sse {
+        // Kiểm tra xem client có phải là Antigravity IDE hay không
+        // Antigravity sử dụng protobuf JSON đặc thù và KHÔNG chấp nhận sentinel [DONE] ở cuối stream
+        let is_antigravity = client_headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(|ua| ua.to_lowercase().contains("antigravity"))
+            .unwrap_or(false);
+
+        // Tạo body stream chuyển tiếp về client
+        // Đối với Antigravity: truyền byte stream trong suốt tuyệt đối để tránh làm hỏng cấu trúc protobuf JSON
+        let boxed_body = if self.config.enable_rust_streamer && is_sse && !is_antigravity {
             tracing::info!("Using Rust zero-copy SSE pipeline for streaming response (path: {})", path);
             let raw_byte_stream = upstream_res.bytes_stream().map(|item| {
                 item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
@@ -98,6 +107,9 @@ impl RouterForwarder {
 
             BodyExt::boxed(StreamBody::new(frame_stream))
         } else {
+            if is_antigravity {
+                tracing::info!("Using transparent streaming passthrough for Antigravity Protobuf JSON client");
+            }
             let byte_stream = upstream_res.bytes_stream().map(|item| {
                 item.map(hyper::body::Frame::data)
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
