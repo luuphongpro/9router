@@ -39,6 +39,7 @@ pub struct AppConfig {
     pub router_base: String,
     pub router_api_key: Option<String>,
     pub port: u16,
+    pub enable_rust_streamer: bool,
     tab_model_regex: Regex,
     aliases_cache: Arc<RwLock<(std::time::Instant, HashMap<String, HashMap<String, String>>)>>,
 }
@@ -70,6 +71,10 @@ impl AppConfig {
             .and_then(|p| p.parse().ok())
             .unwrap_or(443);
 
+        let enable_rust_streamer = std::env::var("ENABLE_RUST_STREAMER")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+
         let tab_model_regex = Regex::new(r"(?i)^tab[_-]").unwrap();
 
         Self {
@@ -78,6 +83,7 @@ impl AppConfig {
             router_base,
             router_api_key,
             port,
+            enable_rust_streamer,
             tab_model_regex,
             aliases_cache: Arc::new(RwLock::new((std::time::Instant::now() - std::time::Duration::from_secs(60), HashMap::new()))),
         }

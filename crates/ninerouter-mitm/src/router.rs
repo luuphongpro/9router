@@ -10,6 +10,9 @@ use hyper::header::HeaderMap;
 use hyper::{Response, StatusCode};
 use reqwest::Client;
 use crate::config::AppConfig;
+use ninerouter_sse::format::Format;
+use ninerouter_sse::pipeline::SseStreamPipeline;
+use ninerouter_sse::translators::create_translator;
 
 pub struct RouterForwarder {
     client: Client,
@@ -71,14 +74,36 @@ impl RouterForwarder {
             res_builder = res_builder.header(k, v);
         }
 
-        // Tạo body stream chuyển tiếp trực tiếp về client
-        let byte_stream = upstream_res.bytes_stream().map(|item| {
-            item.map(hyper::body::Frame::data)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
-        });
+        let is_sse = upstream_res
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("text/event-stream"))
+            .unwrap_or(false);
 
-        let stream_body = StreamBody::new(byte_stream);
-        let boxed_body = BodyExt::boxed(stream_body);
+        // Tạo body stream chuyển tiếp về client (sử dụng Rust SSE pipeline nếu bật và là stream)
+        let boxed_body = if self.config.enable_rust_streamer && is_sse {
+            tracing::info!("Using Rust zero-copy SSE pipeline for streaming response (path: {})", path);
+            let raw_byte_stream = upstream_res.bytes_stream().map(|item| {
+                item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            });
+
+            // Sử dụng translator OpenAI passthrough để chuẩn hoá chunk và tự động fallback nếu gặp lỗi format lạ
+            let translator = create_translator(Format::Openai, Format::Openai);
+            let sse_pipeline = SseStreamPipeline::new(raw_byte_stream, translator);
+
+            let frame_stream = sse_pipeline.map(|item| {
+                item.map(hyper::body::Frame::data)
+            });
+
+            BodyExt::boxed(StreamBody::new(frame_stream))
+        } else {
+            let byte_stream = upstream_res.bytes_stream().map(|item| {
+                item.map(hyper::body::Frame::data)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            });
+            BodyExt::boxed(StreamBody::new(byte_stream))
+        };
 
         Ok(res_builder.body(boxed_body)?)
     }

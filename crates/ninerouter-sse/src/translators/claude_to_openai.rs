@@ -92,7 +92,16 @@ impl StreamTranslator for ClaudeToOpenAiTranslator {
 
         let parsed: Value = match serde_json::from_slice(&event.data) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                // Tự động fallback chuyển tiếp nguyên bản nếu không parse được JSON và ghi log error để kiểm tra sau này
+                tracing::error!(
+                    "Failed to parse Claude SSE JSON payload (len: {}): {}. Falling back to raw passthrough for this event. Payload: '{}'",
+                    event.data.len(),
+                    e,
+                    String::from_utf8_lossy(&event.data).chars().take(100).collect::<String>()
+                );
+                return vec![event.clone()];
+            }
         };
 
         let event_type = parsed
@@ -311,7 +320,15 @@ impl StreamTranslator for ClaudeToOpenAiTranslator {
                 out_events.push(SseEvent::new_data("[DONE]"));
             }
 
-            _ => {}
+            _ => {
+                // Tự động chuyển tiếp nguyên bản nếu gặp event lạ của Claude và ghi log error
+                tracing::error!(
+                    "Unrecognized Claude SSE event type '{}' (len: {}). Falling back to raw passthrough for this event",
+                    event_type,
+                    event.data.len()
+                );
+                out_events.push(event.clone());
+            }
         }
 
         out_events

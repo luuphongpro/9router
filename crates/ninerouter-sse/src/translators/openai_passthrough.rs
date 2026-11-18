@@ -45,8 +45,14 @@ impl StreamTranslator for OpenAiPassthroughTranslator {
 
         let mut parsed: Value = match serde_json::from_slice(&event.data) {
             Ok(v) => v,
-            Err(_) => {
-                // Nếu không parse được JSON nhưng có data, chuyển tiếp nguyên bản
+            Err(e) => {
+                // Tự động fallback chuyển tiếp nguyên bản nếu không parse được JSON và ghi log error
+                tracing::error!(
+                    "Failed to parse OpenAI SSE JSON payload (len: {}): {}. Falling back to raw passthrough for this event. Payload: '{}'",
+                    event.data.len(),
+                    e,
+                    String::from_utf8_lossy(&event.data).chars().take(100).collect::<String>()
+                );
                 return vec![event.clone()];
             }
         };
